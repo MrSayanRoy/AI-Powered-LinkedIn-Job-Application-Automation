@@ -1,1 +1,671 @@
+import path from "node:path";
 
+import { enrichJobDetails } from "./ai/job-enricher.js";
+import { researchRecruiter } from "./research/recruiter-research.js";
+
+import { loadCandidateProfile } from "./config/env.js";
+
+import {
+  launchLinkedInBrowser,
+  ensureLinkedInSession,
+} from "./browser/auth.js";
+
+import { runJobSearch } from "./linkedin/search.js";
+
+import {
+  createGmailDraft,
+  sendGmailDraft,
+} from "./gmail/drafts.js";
+
+import {
+  createApplication,
+  findByPostUrl,
+  listApplications,
+  updateStatus,
+  clearApplications,
+} from "./database/applications.js";
+
+import type { JobListing } from "./config/types.js";
+
+const MODE = process.argv[2];
+
+const SEARCH_TITLES = [
+  "Full Stack Developer",
+  "Full Stack Engineer",
+  "Software Engineer",
+  "Software Developer",
+  "Backend Developer",
+  "Backend Engineer",
+  "Java Developer",
+  "Java Full Stack Developer",
+  "Node.js Developer",
+  "React Developer",
+  "Frontend Developer",
+  "Web Developer",
+];
+
+async function main() {
+  if (MODE === "status") {
+    printStatus();
+    return;
+  }
+
+  if (MODE === "search") {
+    await runSearch();
+    return;
+  }
+
+  if (MODE === "apply") {
+    await runApply();
+    return;
+  }
+
+  if (MODE === "clear") {
+    clearApplications();
+    console.log("✓ All application records cleared.");
+    return;
+  }
+
+  console.log(
+    "Usage: npm run search | npm run apply | npm run status | npm run clear"
+  );
+
+  process.exit(1);
+}
+
+/* ============================================================
+   STATUS
+   ============================================================ */
+
+function printStatus() {
+  const rows = listApplications();
+
+  console.log("\n" + "=".repeat(40));
+  console.log("APPLICATION STATUS");
+  console.log("=".repeat(40));
+
+  if (!rows.length) {
+    console.log("No applications tracked yet.");
+    return;
+  }
+
+  for (const row of rows) {
+    console.log(`\n${row.job_title}`);
+    console.log(`Company: ${row.company_name}`);
+    console.log(`ID: ${row.post_url}`);
+
+    if (row.recruiter_name) {
+      console.log(`Recruiter: ${row.recruiter_name}`);
+    }
+
+    if (row.recruiter_email) {
+      console.log(`Email: ${row.recruiter_email}`);
+    }
+
+    console.log(`Status: ${row.status}`);
+  }
+}
+
+/* ============================================================
+   SEARCH
+   ============================================================ */
+
+async function runSearch() {
+  const context = await launchLinkedInBrowser();
+
+  const page =
+    context.pages()[0] ??
+    (await context.newPage());
+
+  await ensureLinkedInSession(page);
+
+  const allResults = [];
+
+  for (const title of SEARCH_TITLES) {
+    console.log(`\n🔎 Searching for: ${title}`);
+
+    try {
+      const results = await runJobSearch(page, {
+        keywords: title,
+        location: "United States",
+        postedWithinHours: 48,
+        maxPostAgeHours: 48,
+      });
+
+      allResults.push(...results);
+    } catch (error) {
+      console.log(
+        `  ⚠ Search failed for "${title}": ${
+          error instanceof Error
+            ? error.message
+            : "Unknown error"
+        }`
+      );
+    }
+  }
+
+  const results = Array.from(
+    new Map(
+      allResults.map((item) => [
+        item.postUrl,
+        item,
+      ])
+    ).values()
+  );
+
+  console.log(
+    `\nFound ${results.length} unique matching post(s).`
+  );
+
+  for (const item of results) {
+    const existing = findByPostUrl(item.postUrl);
+
+    if (existing) {
+      console.log(
+        `  Skipping already-processed: ${item.title}`
+      );
+      continue;
+    }
+
+    console.log(`\n→ Found: ${item.title}`);
+
+    console.log(
+      `  Company: ${item.company || "Unknown"}`
+    );
+
+    console.log(
+      `  Recruiter: ${item.recruiterName || "Unknown"}`
+    );
+
+    console.log(
+      `  Location: ${item.location}`
+    );
+
+    console.log(
+      `  Posted: ${item.postedText}`
+    );
+
+    createApplication({
+      post_url: item.postUrl,
+      job_title: item.title,
+      recruiter_name:
+        item.recruiterName || null,
+      recruiter_email:
+        item.recruiterEmail || null,
+      company_name:
+        item.company || "Unknown",
+      post_description:
+        item.description,
+      status: "DISCOVERED",
+    });
+
+    console.log(
+      `  Email: ${
+        item.recruiterEmail || "Not found"
+      }`
+    );
+
+    console.log(
+      "  ✓ Saved as DISCOVERED"
+    );
+  }
+
+  console.log("\nSearch complete.");
+
+  console.log(
+    "Run `npm run status` to see discovered jobs."
+  );
+
+  console.log(
+    "Then run `npm run apply`."
+  );
+
+  console.log(
+    "Browser will remain open."
+  );
+
+  console.log(
+    "Press Ctrl+C when finished."
+  );
+
+  await new Promise(() => {});
+}
+
+/* ============================================================
+   APPLY
+   ============================================================ */
+
+async function runApply() {
+  const candidate = loadCandidateProfile();
+
+  const discovered =
+    listApplications().filter(
+      (row) =>
+        row.status === "DISCOVERED"
+    );
+
+  if (!discovered.length) {
+    console.log(
+      "\nNo DISCOVERED jobs found."
+    );
+
+    console.log(
+      "Run `npm run search` first."
+    );
+
+    return;
+  }
+
+  console.log(
+    `\nFound ${discovered.length} discovered job(s).`
+  );
+
+  /*
+   * IMPORTANT:
+   *
+   * No LinkedIn browser is opened here.
+   *
+   * Search already stored the LinkedIn post
+   * information in SQLite.
+   *
+   * Research uses its own headless browser.
+   */
+
+  for (const record of discovered) {
+    console.log(
+      "\n========================================"
+    );
+
+    console.log(
+      `Processing: ${record.job_title}`
+    );
+
+    /* ========================================================
+       BUILD JOB
+       ======================================================== */
+
+        const job: JobListing = {
+      jobTitle: cleanJobTitleText(record.job_title),
+
+      companyName:
+        record.company_name || "Unknown",
+
+      jobDescription:
+        record.post_description || "",
+
+      skillsRequired: [],
+
+      experienceRequired: "",
+
+      location: "United States",
+
+      employmentType: "Full-time",
+
+      postUrl: record.post_url,
+
+      postedText: "",
+
+      postedAgeHours: null,
+
+      recruiterName:
+        record.recruiter_name ??
+        undefined,
+
+      recruiterEmail:
+        record.recruiter_email ??
+        undefined,
+    };
+
+    /* ========================================================
+       PUBLIC RESEARCH
+       ======================================================== */
+
+    console.log(
+      "→ Researching company and recruiter details..."
+    );
+
+    let researchText = "";
+
+    try {
+      researchText =
+        await researchRecruiter(job);
+    } catch (error) {
+      console.log(
+        `  ⚠ Research failed: ${
+          error instanceof Error
+            ? error.message
+            : "Unknown error"
+        }`
+      );
+    }
+
+    /* ========================================================
+       AI ENRICHMENT
+       ======================================================== */
+
+    console.log(
+      "→ Using AI to analyze research..."
+    );
+
+    let enriched;
+
+    try {
+      enriched =
+        await enrichJobDetails(
+          job,
+          researchText
+        );
+    } catch (error) {
+      console.log(
+        `  ⚠ AI enrichment failed: ${
+          error instanceof Error
+            ? error.message
+            : "Unknown error"
+        }`
+      );
+
+console.log(
+  "  ⚠ AI enrichment failed. Keeping job as DISCOVERED for retry."
+);
+
+continue;
+
+      continue;
+    }
+
+    job.companyName =
+      enriched.companyName ||
+      job.companyName;
+
+    job.recruiterName =
+      enriched.recruiterName ||
+      job.recruiterName;
+
+    job.recruiterEmail =
+      enriched.recruiterEmail ||
+      job.recruiterEmail;
+
+    console.log(
+      `  Company: ${
+        job.companyName || "Unknown"
+      }`
+    );
+
+    console.log(
+      `  Recruiter: ${
+        job.recruiterName || "Unknown"
+      }`
+    );
+
+    console.log(
+      `  Public email: ${
+        job.recruiterEmail || "Not found"
+      }`
+    );
+
+    if (enriched.emailSource) {
+      console.log(
+        `  Email source: ${enriched.emailSource}`
+      );
+    }
+
+    console.log(
+      `  Confidence: ${enriched.confidence}`
+    );
+
+    /* ========================================================
+       FIND EMAIL
+       ======================================================== */
+
+    const emailMatch =
+      record.post_description.match(
+        /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i
+      );
+
+    const recipient =
+      job.recruiterEmail ??
+      emailMatch?.[0] ??
+      "";
+
+    if (!recipient) {
+      console.log(
+        "  No verified public recruiter email found."
+      );
+
+      updateStatus(
+        record.application_id,
+        "SKIPPED"
+      );
+
+      continue;
+    }
+
+    console.log(
+      `  ✓ Recruiter email found: ${recipient}`
+    );
+
+    updateStatus(
+      record.application_id,
+      "DISCOVERED",
+      {
+        recruiter_email:
+          recipient,
+
+        recruiter_name:
+          job.recruiterName ||
+          null,
+
+        post_description:
+          job.jobDescription,
+      }
+    );
+
+    /* ========================================================
+       FIXED APPLICATION EMAIL
+       ======================================================== */
+
+    const recruiterName =
+      job.recruiterName ||
+      "Hiring Manager";
+
+    const companyName =
+      job.companyName ||
+      "your company";
+
+        const subject =
+      `Submission for ${job.jobTitle} - ${candidate.name}`;
+
+    const emailBody = `Dear ${recruiterName},
+
+I am writing to express my interest in the ${job.jobTitle} position at ${companyName}. Please find my resume attached for your consideration.
+
+I would appreciate the opportunity to discuss how my skills and background could contribute to the role.
+
+
+----------------------------------------
+JOB DETAILS
+
+Job Title:
+${job.jobTitle}
+
+Company:
+${companyName}
+
+Job Description:
+${job.jobDescription || "Not available"}
+
+LinkedIn Job Post:
+${job.postUrl}
+----------------------------------------
+Best regards,
+Sayan Roy`;
+
+    console.log(
+      `  Recruiter: ${recruiterName}`
+    );
+
+    console.log(
+      `  Company: ${companyName}`
+    );
+
+    console.log(
+      `  Recipient: ${recipient}`
+    );
+
+
+    /* ========================================================
+       RESUME
+       ======================================================== */
+
+    const resumePath =
+      path.resolve(
+        candidate.resumePath
+      );
+
+    /* ========================================================
+       CREATE + SEND GMAIL
+       ======================================================== */
+
+    console.log(
+      "→ Creating Gmail draft..."
+    );
+
+    let draftId: string;
+
+    try {
+      draftId =
+        await createGmailDraft({
+          to: recipient,
+          subject,
+          body: emailBody,
+          attachmentPath:
+            resumePath,
+          attachmentFilename:
+            `${
+              candidate.name ||
+              "resume"
+            } - ${
+              job.jobTitle
+            }.pdf`,
+        });
+    } catch (error) {
+      console.log(
+        `  ⚠ Gmail draft creation failed: ${
+          error instanceof Error
+            ? error.message
+            : "Unknown error"
+        }`
+      );
+
+console.log(
+  "  ⚠ Gmail draft creation failed. Keeping job as DISCOVERED for retry."
+);
+
+continue;
+    }
+
+    console.log(
+      "→ Sending Gmail draft..."
+    );
+
+    try {
+      await sendGmailDraft(
+        draftId
+      );
+    } catch (error) {
+      console.log(
+        `  ⚠ Gmail send failed: ${
+          error instanceof Error
+            ? error.message
+            : "Unknown error"
+        }`
+      );
+
+      /*
+       * Draft exists, but it wasn't sent.
+       * Keep the record as DRAFT_CREATED.
+       */
+      updateStatus(
+        record.application_id,
+        "DRAFT_CREATED",
+        {
+          resume_path:
+            resumePath,
+        }
+      );
+
+      continue;
+    }
+
+    /* ========================================================
+       DATABASE UPDATE
+       ======================================================== */
+
+    updateStatus(
+      record.application_id,
+      "SENT",
+      {
+        resume_path:
+          resumePath,
+      }
+    );
+
+    console.log(
+      "✓ Gmail draft created and sent."
+    );
+  }
+
+  console.log(
+    "\n========================================"
+  );
+
+  console.log(
+    "Apply process complete."
+  );
+
+  console.log(
+    "Run `npm run status` to see results."
+  );
+
+  console.log(
+    "========================================"
+  );
+}
+
+/* ============================================================
+   START
+   ============================================================ */
+
+/**
+ * Fix common UTF-8 mojibake and strip a leading bullet
+ * character from job titles pulled out of raw LinkedIn post text.
+ */
+function cleanJobTitleText(value: string | undefined): string {
+  if (!value) {
+    return "";
+  }
+
+  let text = value.trim();
+
+  text = text
+    .replace(/Ã¢Â€Â¢/g, "•")
+    .replace(/Ã¢Â€Â“/g, "–")
+    .replace(/Ã¢Â€Â”/g, "—")
+    .replace(/Ã¢â‚¬Â¢/g, "•")
+    .replace(/â€¢/g, "•")
+    .replace(/Â·/g, "·")
+    .replace(/â€“/g, "–")
+    .replace(/â€”/g, "—")
+    .replace(/â€™/g, "'")
+    .replace(/â€œ/g, '"')
+    .replace(/â€\u009d/g, '"');
+
+  text = text.replace(/^[•·●▪◦]\s*/u, "").trim();
+
+  return text;
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
